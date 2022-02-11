@@ -10,6 +10,7 @@ import glob
 from omegaconf import OmegaConf
 import pkg_resources
 import re
+from multiprocessing.pool import ThreadPool
 
 CRON = False
 VERBOSE = False
@@ -99,14 +100,14 @@ def zfs_snapshot(conf, dataset, snapshot_name):
     ssh_cmd(conf, ["zfs", "snapshot", f"{dataset}@{snapshot_name}"])
 
 
-def delete_temporary_dump_dirs(backup_dir):
-    for tempdir in glob.glob(f"{backup_dir}/*.{TEMPDIR_SUFFIX}"):
+def delete_temporary_dump_dirs(temp_dir):
+    for tempdir in glob.glob(f"{temp_dir}/*.{TEMPDIR_SUFFIX}"):
         log(f"Deleting dead temporary dump dir : {tempdir}")
         shutil.rmtree(tempdir)
 
 
-def is_dump_in_progress(conf, backup_dir):
-    for tempdir in glob.glob(f"{backup_dir}/*.{TEMPDIR_SUFFIX}"):
+def is_dump_in_progress(conf, temp_dir):
+    for tempdir in glob.glob(f"{temp_dir}/*.{TEMPDIR_SUFFIX}"):
         timestamps = [os.path.getmtime(f"{tempdir}/{x}") for x in os.listdir(tempdir)]
         if len(timestamps) == 0:
             return False
@@ -121,6 +122,31 @@ def ensure_clean_exit(process):
         raise Exception(
             f"{' '.join(process.args)} exited with non zero exit code {process.returncode}"
         )
+
+def get_gzip_cmd(conf):
+    ssh = Popen(get_ssh_cmd_arr(conf) + ['command -v pigz'], stdout=PIPE)
+
+    pigz = ssh.communicate()
+    ssh.wait()
+    ensure_clean_exit(ssh)
+    if b'pigz' in pigz[0]:
+        return ['pigz', '-p', str(conf.backup.parallel or 1)]
+    return ['gzip']
+
+
+class MultithreadedCopier:
+    def __init__(self, max_threads):
+        self.pool = ThreadPool(max_threads)
+
+    def copy(self, source, dest):
+        self.pool.apply_async(shutil.copy2, args=(source, dest))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.pool.close()
+        self.pool.join()
 
 
 def zfs_dump_snapshot(
@@ -143,15 +169,25 @@ def zfs_dump_snapshot(
         log(f"Dump is already in progress in {backup_dir}, bailing up")
         return False
 
+    base_temp_dir = conf.backup.temp_directory
+    if base_temp_dir is None:
+        base_temp_dir = backup_dir
+    
     # delete dead dump directories
-    delete_temporary_dump_dirs(backup_dir)
+    delete_temporary_dump_dirs(base_temp_dir)
 
     parts_dir = f"{backup_dir}/{backup_type}##{snapshot_name}"
-    temporary_dir = f"{parts_dir}.{TEMPDIR_SUFFIX}"
+    
+    parts_temp_dir = f"{base_temp_dir}/{backup_type}##{snapshot_name}"
+    temporary_dir = f"{parts_temp_dir}.{TEMPDIR_SUFFIX}"
     os.makedirs(temporary_dir)
+    os.makedirs(backup_dir, exist_ok=True)
+
+
 
     ssh = Popen(get_ssh_cmd_arr(conf) + zfs_cmd, stdout=PIPE)
-    gzip = chain(ssh, "gzip")
+    gzip_cmd = get_gzip_cmd(conf)
+    gzip = chain(ssh, gzip_cmd)
     split = chain(
         gzip,
         [
@@ -174,8 +210,16 @@ def zfs_dump_snapshot(
     ensure_clean_exit(split)
 
     cleanup_dataset_snapshots(conf, dataset)
+    
+    log(f"Move from {temporary_dir} -> {parts_dir}")
+    try:
 
-    os.rename(temporary_dir, parts_dir)
+        os.rename(temporary_dir, parts_dir)
+    except Exception:
+
+        with MultithreadedCopier(max_threads=int(conf.backup.parallel or 1)) as copier:
+            shutil.copytree(temporary_dir, parts_dir, copy_function=copier.copy)
+        delete_temporary_dump_dirs(base_temp_dir)
     return True
 
 

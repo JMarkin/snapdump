@@ -10,8 +10,12 @@ server:
   ssh_options: '-q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
 
 backup:
+  parallel: 10
   # Directory to dump stapshots into
   directory: /mnt/something_big
+  
+  # Directory for temporary files, backup dir may only slow writes
+  temp_directory: /mnt/little_fast_temp_dir
 
   # names of datasets to dump
   datasets:
